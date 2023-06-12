@@ -352,26 +352,47 @@ export default function fetch(url, opts) {
 };
 
 function fixResponseChunkedTransferBadEnding(request, errorCallback) {
-	let socket;
+	const LAST_CHUNK = Buffer.from('0\r\n\r\n');
 
-	request.on('socket', s => {
-		socket = s;
-	});
+	let isChunkedTransfer = false;
+	let properLastChunkReceived = false;
+	let previousChunk;
 
 	request.on('response', response => {
 		const {headers} = response;
-		if (headers['transfer-encoding'] === 'chunked' && !headers['content-length']) {
-			response.once('close', hadError => {
-				// if a data listener is still present we didn't end cleanly
-				const hasDataListener = socket.listenerCount('data') > 0;
+		isChunkedTransfer = headers['transfer-encoding'] === 'chunked' && !headers['content-length'];
+	});
 
-				if (hasDataListener && !hadError) {
-					const err = new Error('Premature close');
-					err.code = 'ERR_STREAM_PREMATURE_CLOSE';
-					errorCallback(err);
-				}
-			});
-		}
+	request.on('socket', socket => {
+		const onSocketClose = () => {
+			if (isChunkedTransfer && !properLastChunkReceived) {
+				const error = new Error('Premature close');
+				error.code = 'ERR_STREAM_PREMATURE_CLOSE';
+				errorCallback(error);
+			}
+		};
+
+		const onData = buf => {
+			properLastChunkReceived = Buffer.compare(buf.slice(-5), LAST_CHUNK) === 0;
+
+			// Sometimes final 0-length chunk and end of message code are in separate packets
+			if (!properLastChunkReceived && previousChunk) {
+				properLastChunkReceived = (
+					Buffer.compare(previousChunk.slice(-3), LAST_CHUNK.slice(0, 3)) === 0 &&
+					Buffer.compare(buf.slice(-2), LAST_CHUNK.slice(3)) === 0
+				);
+			}
+
+			previousChunk = buf;
+		};
+
+		socket.prependListener('close', onSocketClose);
+		socket.on('data', onData);
+
+		request.on('close', () => {
+			socket.removeListener('close', onSocketClose);
+			socket.removeListener('data', onData);
+		});
 	});
 }
 
